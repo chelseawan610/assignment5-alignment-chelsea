@@ -79,10 +79,17 @@ def grpo_train_step(model, tokenizer, optimizer, gradient_accumulation_steps, ma
     from .sft import get_response_log_probs
     raw_rewards, metadata = compute_rollout_rewards(reward_fn, rollout_responses, repeated_ground_truths)
     advantages, reward_meta = compute_group_normalized_rewards(raw_rewards, group_size, baseline, advantage_eps, advantage_normalizer)
-    batch = tokenize_prompt_and_output(repeated_prompts, rollout_responses, tokenizer)
+    keep = advantages != 0
+    advantages = advantages[keep]
+    prompts = [prompt for prompt, selected in zip(repeated_prompts, keep.tolist()) if selected]
+    responses = [response for response, selected in zip(rollout_responses, keep.tolist()) if selected]
+    if old_log_probs is not None:
+        old_log_probs = old_log_probs[keep]
+    batch = tokenize_prompt_and_output(prompts, responses, tokenizer)
     input_ids, labels, response_mask = batch["input_ids"], batch["labels"], batch["response_mask"]
     optimizer.zero_grad()
-    micro_losses = []
+    total_batch_size = input_ids.shape[0]
+    batch_loss = torch.zeros((), device=input_ids.device)
     loss_meta = {}
     for ids, labs, mask, adv, old in zip(
         input_ids.chunk(gradient_accumulation_steps),
@@ -91,19 +98,18 @@ def grpo_train_step(model, tokenizer, optimizer, gradient_accumulation_steps, ma
         advantages.chunk(gradient_accumulation_steps),
         old_log_probs.chunk(gradient_accumulation_steps) if old_log_probs is not None else [None] * gradient_accumulation_steps,
     ):
-        logs = get_response_log_probs(model, ids, labs, False)["log_probs"]
-        per_token, loss_meta = compute_policy_gradient_loss(adv, logs, importance_reweighting_method, old, cliprange, mask)
-        micro_loss = aggregate_loss_across_microbatch(per_token, mask, loss_normalization, normalization_constant)
-        micro_losses.append(micro_loss)
-        (micro_loss / gradient_accumulation_steps).backward()
-    if loss_normalization == "sequence":
-        # The logged batch loss uses token-weighted aggregation; gradients
-        # above still follow the requested microbatch normalization.
-        with torch.no_grad():
-    loss = torch.stack(micro_losses).mean()
-
-    else:
-        loss = torch.stack(micro_losses).mean()
+        result = get_response_log_probs(model, ids, labs, True)
+        per_token, loss_meta = compute_policy_gradient_loss(
+            adv, result["log_probs"], importance_reweighting_method, old, cliprange, mask
+        )
+        micro_loss = aggregate_loss_across_microbatch(
+            per_token, mask, loss_normalization, normalization_constant
+        )
+        weight = ids.shape[0] / total_batch_size if loss_normalization == "sequence" else 1.0
+        adjusted_loss = micro_loss * weight
+        batch_loss = batch_loss + adjusted_loss.detach()
+        adjusted_loss.backward()
+    loss = batch_loss
 
     if max_grad_norm is not None:
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
